@@ -5,10 +5,6 @@
 #include <stdint.h>
 #include <time.h>
 #include <THREADSLib.h>
-
-#define system_call_arguments_t sysargs
-#define STATUS_SLEEP_BLOCKED 10
-#define STATUS_DISK_BLOCKED  11
 #include <Messaging.h>
 #include <Scheduler.h>
 #include <TList.h>
@@ -16,70 +12,96 @@
 #include <SystemCalls.h>
 #include <Devices.h>
 
-/* Set the disk arm scheduling algorithm. */
-#define DISK_ARM_ALG   DISK_ARM_ALG_FCFS
+// ==========================================
+// Changed from DISK_ARM_ALG_FCFS to SSTF
+// ==========================================
+#define DISK_ARM_ALG            DISK_ARM_ALG_SSTF
+#define MICROSECONDS_PER_SECOND 1000000
+#define DISK_INFO               0x01
 
-/* Globals and Data Structures for Clock Driver */
-static int clockMbox;
+static TList sleeping_processes;
+static int   sleeping_processes_mutex;
+static int   ClockDriver(char*);
+static int   DiskDriver(char*);
+static void  sysCall4(system_call_arguments_t* args);
+static int   sleep_compare(void* a, void* b);
 
-typedef struct {
-    int pid;
-    int sleepTimeSeconds;
-} ClockMessage;
-
-typedef struct SleepNode {
-    struct SleepNode* pNext;  /* Must be first for TList (offset 0) */
-    struct SleepNode* pPrev;
-    int pid;
-    unsigned int wakeTime;    /* Time in microseconds when process should wake */
-} SleepNode;
-
-/* Ordering function to keep the sleep queue sorted by earliest wake time */
-static int SleepOrder(void* p1, void* p2)
+typedef struct
 {
-    SleepNode* n1 = (SleepNode*)p1;
-    SleepNode* n2 = (SleepNode*)p2;
+    TListNode          listNode;
+    int                pid;
+    int                waitSem;
+    unsigned long long wakeup_time;
+} SleepingProcess;
 
-    if (n1->wakeTime < n2->wakeTime) return -1;
-    if (n1->wakeTime > n2->wakeTime) return 1;
-    return 0;
-}
+typedef struct
+{
+    int platters;
+    int sectors;
+    int tracks;
+    int disk;
+} DiskInformation;
 
-/* Prototypes */
-static int ClockDriver(char*);
-static int DiskDriver(char*);
-extern int DevicesEntryPoint(char*);
+static DiskInformation diskInfo[THREADS_MAX_DISKS];
+static int             diskRequestSems[THREADS_MAX_DISKS];
+
+// ==========================================
+// SSTF QUEUE STRUCTURES AND GLOBALS
+// ==========================================
+typedef struct disk_request
+{
+    int                      type;         // SYS_DISKREAD, SYS_DISKWRITE, SYS_DISKINFO
+    system_call_arguments_t* args;         // original system call arguments
+    int                      waitSem;      // semaphore to wake the caller
+    int                      track;        // target track (for SSTF seek)
+    int                      first_sector; // first sector to read/write
+    int                      sectors;      // number of sectors
+    void* buffer;       // data buffer
+    int* status_ptr;   // caller's DiskRead/DiskWrite status out pointer
+    struct disk_request* next;
+} disk_request_t;
+
+static disk_request_t* requestQueueHead[THREADS_MAX_DISKS];
+static disk_request_t* requestQueueTail[THREADS_MAX_DISKS];
+static int             requestQueueMutex[THREADS_MAX_DISKS];
+
+// Current arm position per disk (for SSTF)
+static int currentTrack[THREADS_MAX_DISKS];
+
+int    sys_sleep(int seconds);
 static inline void checkKernelMode(const char* functionName);
+extern int DevicesEntryPoint(char*);
 
-void SysSleepHandler(system_call_arguments_t* args);
-void SysDiskReadHandler(system_call_arguments_t* args);
-void SysDiskWriteHandler(system_call_arguments_t* args);
-void SysDiskInfoHandler(system_call_arguments_t* args);
+// ==========================================
+// Helper: absolute value for int
+// ==========================================
+static int int_abs(int x) { return x < 0 ? -x : x; }
 
-/* System Calls Entry Point */
 int SystemCallsEntryPoint(char* arg)
 {
-    char    buf[25];
-    char    name[128];
-    int     i;
-    int     clockPID = 0;
-    int     diskPids[THREADS_MAX_DISKS];
-    int     status;
+    char buf[25];
+    char name[128];
+    int  i;
+    int  clockPID = 0;
+    int  diskPids[THREADS_MAX_DISKS];
+    int  status;
 
     checkKernelMode(__func__);
 
-    /* Assign system call handlers */
-    systemCallVector[SYS_SLEEP] = SysSleepHandler;
-    systemCallVector[SYS_DISKREAD] = SysDiskReadHandler;
-    systemCallVector[SYS_DISKWRITE] = SysDiskWriteHandler;
-    systemCallVector[SYS_DISKINFO] = SysDiskInfoHandler;
+    systemCallVector[SYS_SLEEP] = sysCall4;
+    systemCallVector[SYS_DISKREAD] = sysCall4;
+    systemCallVector[SYS_DISKWRITE] = sysCall4;
+    systemCallVector[SYS_DISKINFO] = sysCall4;
 
-    /* Initialize the process table */
-    for (i = 0; i < MAXPROC; ++i)
+    TListInitialize(&sleeping_processes, offsetof(SleepingProcess, listNode), sleep_compare);
+    sleeping_processes_mutex = k_semcreate(1);
+
+    if (sleeping_processes_mutex < 0)
     {
+        console_output(TRUE, "SystemCallsEntryPoint(): Can't create sleeping_processes_mutex\n");
+        stop(1);
     }
 
-    /* Create and start the clock driver */
     clockPID = k_spawn("Clock driver", ClockDriver, NULL, THREADS_MIN_STACK_SIZE, HIGHEST_PRIORITY);
     if (clockPID < 0)
     {
@@ -87,9 +109,15 @@ int SystemCallsEntryPoint(char* arg)
         stop(1);
     }
 
-    /* Create the disk drivers */
+    /* Initialize Disk Drivers, SSTF queues, and arm positions */
     for (i = 0; i < THREADS_MAX_DISKS; i++)
     {
+        diskRequestSems[i] = k_semcreate(0);
+        requestQueueMutex[i] = k_semcreate(1);
+        requestQueueHead[i] = NULL;
+        requestQueueTail[i] = NULL;
+        currentTrack[i] = 0; // arm starts at track 0
+
         sprintf(buf, "%d", i);
         sprintf(name, "DiskDriver%d", i);
         diskPids[i] = k_spawn(name, DiskDriver, buf, THREADS_MIN_STACK_SIZE * 4, HIGHEST_PRIORITY);
@@ -100,135 +128,363 @@ int SystemCallsEntryPoint(char* arg)
         }
     }
 
-    /* Create first user-level process and wait for it to finish */
-    sys_spawn("DevicesEntryPoint", DevicesEntryPoint, NULL, 8 * THREADS_MIN_STACK_SIZE, 3);
+    int devicesPid = sys_spawn("DevicesEntryPoint", DevicesEntryPoint, NULL, 8 * THREADS_MIN_STACK_SIZE, 3);
     sys_wait(&status);
+
+    k_kill(clockPID, 15);
+
+    for (i = 0; i < THREADS_MAX_DISKS; i++)
+    {
+        k_kill(diskPids[i], 15);
+        k_semv(diskRequestSems[i]);
+    }
+
+    for (i = 0; i < 1 + THREADS_MAX_DISKS; i++)
+    {
+        k_wait(&status);
+    }
 
     return 0;
 }
 
-/* System Call Handlers */
-void SysSleepHandler(system_call_arguments_t* args)
-{
-    ClockMessage msg;
-
-    /* args->arg1 contains the number of seconds to sleep */
-    msg.sleepTimeSeconds = (int)(long)args->arg1;
-    msg.pid = k_getpid();
-
-    /* Send the message to the clock driver without blocking */
-    mailbox_send(clockMbox, &msg, sizeof(msg), FALSE);
-
-    /* Safely block this process until the Clock Driver wakes it up */
-    block(STATUS_SLEEP_BLOCKED);
-}
-
-void SysDiskReadHandler(system_call_arguments_t* args) { /* To be implemented */ }
-void SysDiskWriteHandler(system_call_arguments_t* args) { /* To be implemented */ }
-void SysDiskInfoHandler(system_call_arguments_t* args) { /* To be implemented */ }
-
-/* Clock Driver */
 static int ClockDriver(char* arg)
 {
     int result;
     int status;
-    TList sleepQueue;
-    ClockMessage msg;
-    SleepNode* head;
-
-    /* Initialize the sleep queue (offset to pNext/pPrev is 0) */
-    TListInitialize(&sleepQueue, 0, SleepOrder);
-
-    /* Create the mailbox for receiving sleep requests */
-    clockMbox = mailbox_create(MAXSLOTS, sizeof(ClockMessage));
-
     set_psr(get_psr() | PSR_INTERRUPTS);
 
     while (!signaled())
     {
-        /* Wait for the hardware clock to tick */
         result = wait_device("clock", &status);
-        if (result != 0)
+        if (result != 0) return 0;
+
+        k_semp(sleeping_processes_mutex);
         {
-            return 0;
+            unsigned long long current_time = system_clock();
+            while (sleeping_processes.count > 0)
+            {
+                SleepingProcess* pHead = (SleepingProcess*)sleeping_processes.pHead;
+                if (pHead->wakeup_time > current_time) break;
+
+                SleepingProcess* pWake = (SleepingProcess*)TListPopNode(&sleeping_processes);
+
+                k_semv(pWake->waitSem);
+                free(pWake);
+            }
         }
-
-        /* 1. Check for NEW sleep requests (non-blocking receive) */
-        while (mailbox_receive(clockMbox, &msg, sizeof(msg), FALSE) == sizeof(msg))
-        {
-            SleepNode* newNode = (SleepNode*)malloc(sizeof(SleepNode));
-            newNode->pid = msg.pid;
-
-            /* read_time() returns microseconds. Convert seconds to microseconds. */
-            newNode->wakeTime = read_time() + (msg.sleepTimeSeconds * 1000000);
-
-            TListAddNodeInOrder(&sleepQueue, newNode);
-        }
-
-        /* 2. Wake up any processes whose time has come */
-        head = (SleepNode*)sleepQueue.pHead;
-        while (head != NULL && head->wakeTime <= read_time())
-        {
-            /* Pop the process off the queue */
-            head = (SleepNode*)TListPopNode(&sleepQueue);
-
-            /* Unblock it so the scheduler can run it again */
-            unblock(head->pid);
-
-            /* Free the node memory */
-            free(head);
-
-            /* Check the next process in line */
-            head = (SleepNode*)sleepQueue.pHead;
-        }
+        k_semv(sleeping_processes_mutex);
     }
     return 0;
 }
 
-/* Disk Driver Skeleton (Phase 3) */
+// ==========================================
+// SSTF: Select the request whose track is
+// closest to the current arm position.
+// Must be called while holding requestQueueMutex.
+// ==========================================
+static disk_request_t* sstf_dequeue(int unit)
+{
+    if (requestQueueHead[unit] == NULL)
+        return NULL;
+
+    // Find the node with the shortest seek distance
+    disk_request_t* best_prev = NULL;
+    disk_request_t* best = requestQueueHead[unit];
+    int             best_dist = int_abs(best->track - currentTrack[unit]);
+
+    disk_request_t* prev = requestQueueHead[unit];
+    disk_request_t* cur = prev->next;
+
+    while (cur != NULL)
+    {
+        int dist = int_abs(cur->track - currentTrack[unit]);
+        if (dist < best_dist)
+        {
+            best_dist = dist;
+            best = cur;
+            best_prev = prev;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+
+    // Remove best from the list
+    if (best_prev == NULL)
+    {
+        // best is the head
+        requestQueueHead[unit] = best->next;
+    }
+    else
+    {
+        best_prev->next = best->next;
+    }
+
+    if (best->next == NULL)
+    {
+        // best was the tail; find new tail
+        if (requestQueueHead[unit] == NULL)
+        {
+            requestQueueTail[unit] = NULL;
+        }
+        else
+        {
+            disk_request_t* t = requestQueueHead[unit];
+            while (t->next != NULL) t = t->next;
+            requestQueueTail[unit] = t;
+        }
+    }
+
+    best->next = NULL;
+    return best;
+}
+
 static int DiskDriver(char* arg)
 {
-    int unit = atoi(arg);
-    int status;
-    char deviceName[16];
+    int                   unit = atoi(arg);
+    int                   status;
+    char                  devName[16];
+    device_control_block_t devRequest;
 
-    /* Format the device name string (e.g., "disk0", "disk1") */
-    sprintf(deviceName, "disk%d", unit);
-
+    sprintf(devName, "disk%d", unit);
     set_psr(get_psr() | PSR_INTERRUPTS);
+
+    // Retrieve native disk geometry from hardware
+    memset(&devRequest, 0, sizeof(devRequest));
+    devRequest.command = DISK_INFO;
+    devRequest.output_data = &diskInfo[unit];
+    device_control(devName, devRequest);
+    wait_device(devName, &status);
 
     while (!signaled())
     {
-        /* Temporarily block and wait for a disk interrupt so the driver
-         * goes to sleep and stops hogging the CPU!
-         */
-        wait_device(deviceName, &status);
+        k_semp(diskRequestSems[unit]); // Wait for a request
+
+        if (signaled()) break;
+
+        disk_request_t* req = NULL; //dequeue the next request with SSTF scheduling
+
+        k_semp(requestQueueMutex[unit]); // Lock the queue
+        req = sstf_dequeue(unit); // Dequeue using SSTF scheduling
+        k_semv(requestQueueMutex[unit]); // Unlock the queue
+
+        if (req == NULL) continue;
+
+        if (req->type == SYS_DISKINFO)
+        {
+            /* Direct Array Assignment: The user wrapper expects us to overwrite
+               the array slots with the integers, NOT dereference them as pointers! */
+            req->args->arguments[0] = (void*)(intptr_t)512;                      // sectorSize
+            req->args->arguments[1] = (void*)(intptr_t)diskInfo[unit].sectors;   // sectorCount
+            req->args->arguments[2] = (void*)(intptr_t)diskInfo[unit].tracks;    // trackCount
+            req->args->arguments[3] = (void*)(intptr_t)diskInfo[unit].platters;  // platterCount
+
+            req->args->arguments[4] = (void*)(intptr_t)0; // Return success code
+        }
+        else if (req->type == SYS_DISKREAD || req->type == SYS_DISKWRITE)
+        {
+            memset(&devRequest, 0, sizeof(devRequest)); // Clear the control block
+            devRequest.command = (req->type == SYS_DISKREAD) ? DISK_READ : DISK_WRITE;
+            devRequest.control1 = (uint8_t)req->track; // Track number to seek to
+            devRequest.control2 = (uint8_t)req->first_sector; // First sector number
+            devRequest.data_length = (uint32_t)req->sectors; // Number of sectors
+
+            if (req->type == SYS_DISKREAD)
+            {
+                devRequest.output_data = req->buffer; // For reads, buffer is output
+            }
+            else
+            {
+                devRequest.input_data = req->buffer; // For writes, buffer is input
+            }
+
+            status = 0;
+            device_control(devName, devRequest);
+            wait_device(devName, &status);
+
+            currentTrack[unit] = req->track; // Update hardware arm position for SSTF
+
+            /* The OS wrapper expects the hardware status out-variable in arguments[0] */
+            req->args->arguments[0] = (void*)(intptr_t)status;
+
+            req->args->arguments[5] = (void*)(intptr_t)0; // syscall return code
+        }
+
+        // Wake the waiting user thread
+        k_semv(req->waitSem);
     }
+
     return 0;
 }
 
-/* Helper Functions */
 struct psr_bits {
-    unsigned int cur_int_enable : 1;
-    unsigned int cur_mode : 1;
-    unsigned int prev_int_enable : 1;
-    unsigned int prev_mode : 1;
-    unsigned int unused : 28;
+    unsigned int cur_int_enable : 1;// bit 0: current interrupt enable
+    unsigned int cur_mode : 1;// bit 1: current mode (0 = user, 1 = kernel)
+    unsigned int prev_int_enable : 1;// bit 2: previous interrupt enable
+    unsigned int prev_mode : 1;// bit 3: previous mode (0 = user, 1 = kernel)
+    unsigned int unused : 28; // bits 4-31: unused
 };
 
 union psr_values {
     struct psr_bits bits;
-    unsigned int integer_part;
+    unsigned int    integer_part;
 };
 
 static inline void checkKernelMode(const char* functionName)
 {
     union psr_values psrValue;
-
     psrValue.integer_part = get_psr();
     if (psrValue.bits.cur_mode == 0)
     {
         console_output(FALSE, "Kernel mode expected, but function called in user mode.\n");
         stop(1);
     }
+}
+
+static void enqueue_request(int unit, disk_request_t* req) // Enqueue a disk request at the tail of the queue for the specified disk unit
+{
+    k_semp(requestQueueMutex[unit]);// Lock the queue while we modify it
+    req->next = NULL; // New request will be at the tail, so next is NULL
+    if (requestQueueTail[unit] == NULL) // Queue is empty
+    {
+        requestQueueHead[unit] = req; // New request is now the head
+        requestQueueTail[unit] = req; // New request is also the tail since it's the only request in the queue
+    }
+    else
+    {
+        requestQueueTail[unit]->next = req;
+        requestQueueTail[unit] = req; // New request is now the tail
+    }
+    k_semv(requestQueueMutex[unit]); // Unlock the queue after modification
+}
+
+static void sysCall4(system_call_arguments_t* args)
+{
+    switch (args->call_id)
+    {
+    case SYS_SLEEP:
+        args->arguments[3] = (intptr_t)sys_sleep((int)args->arguments[0]);
+        break;
+
+    case SYS_DISKINFO:
+    {
+        /* Extract the '0' or '1'from the "disk0" string */
+        char* deviceName = (char*)(intptr_t)args->arguments[0];
+        int unit = -1;
+        if (deviceName != NULL) {
+            unit = deviceName[4] - '0';
+        }
+
+        if (unit < 0 || unit >= THREADS_MAX_DISKS)
+        {
+            args->arguments[5] = (intptr_t)-1;
+            break;
+        }
+
+        disk_request_t* req = (disk_request_t*)malloc(sizeof(disk_request_t)); // Allocate a request structure
+        if (req == NULL) { args->arguments[5] = (intptr_t)-1; break; } // Check for malloc failure
+
+        memset(req, 0, sizeof(disk_request_t)); // Clear the request structure before setting fields
+        req->type = SYS_DISKINFO; // Set the request type to DISKINFO
+        req->args = args; // Pass original args so DiskDriver can fill in output values
+        req->waitSem = k_semcreate(0); // Create a semaphore for completion
+        req->track = 0; // DISKINFO has no seek cost 
+
+        enqueue_request(unit, req); // Enqueue the request
+        k_semv(diskRequestSems[unit]); // Signal the disk driver
+        k_semp(req->waitSem); // Wait for the disk driver to process
+
+        k_semfree(req->waitSem);
+        free(req);
+        break;
+    }
+
+    case SYS_DISKREAD:
+    case SYS_DISKWRITE:
+    {
+        char* deviceName = (char*)(intptr_t)args->arguments[0];
+        int unit = -1;
+        if (deviceName != NULL) {
+            unit = deviceName[4] - '0';
+        }
+
+        /* Correctly map the arguments based on the OS wrapper */
+        void* buffer = (void*)(intptr_t)args->arguments[1];
+        /* args->arguments[2] is the platter, which is ignored here */
+        int track = (int)args->arguments[3];
+        int first_sector = (int)args->arguments[4];
+        int sectors = (int)args->arguments[5];
+
+        if (unit < 0 || unit >= THREADS_MAX_DISKS)
+        {
+            args->arguments[5] = (intptr_t)-1;
+            break;
+        }
+
+        disk_request_t* req = (disk_request_t*)malloc(sizeof(disk_request_t));
+        if (req == NULL) { args->arguments[5] = (intptr_t)-1; break; }
+
+        memset(req, 0, sizeof(disk_request_t));
+        req->type = args->call_id;
+        req->args = args;
+        req->waitSem = k_semcreate(0);
+        req->track = track;
+        req->first_sector = first_sector;
+        req->sectors = sectors;
+        req->buffer = buffer;
+
+        enqueue_request(unit, req);
+        k_semv(diskRequestSems[unit]);
+        k_semp(req->waitSem);
+
+        k_semfree(req->waitSem);
+        free(req);
+        break;
+    }
+
+    default:
+        args->arguments[3] = (intptr_t)-1;
+        break;
+    }
+}
+
+int sys_sleep(int seconds)
+{
+    SleepingProcess* pProcInfo; // Structure to hold information about the sleeping process
+    int              waitSem; // Semaphore that the process will wait on until it's time to wake up
+
+    if (seconds < 0) return -1; // Invalid argument: negative sleep time
+    if (seconds == 0) return 0; // No need to sleep if the time is 0
+
+    waitSem = k_semcreate(0); // Create a semaphore that the process will wait on. It will be signaled by the clock driver when it's time to wake up.    
+    if (waitSem < 0) return -1; // Check for semaphore creation failure
+
+    pProcInfo = (SleepingProcess*)malloc(sizeof(SleepingProcess)); // Allocate a structure to hold the sleeping process's information. This will be added to the sleeping_processes list so the clock driver can wake it up at the right time.
+    if (pProcInfo == NULL) // Check for malloc failure
+    {
+        k_semfree(waitSem);
+        return -1;
+    }
+
+    pProcInfo->pid = k_getpid(); // Store the PID of the sleeping process so the clock driver knows which process to wake up
+    pProcInfo->waitSem = waitSem; // Store the semaphore that the clock driver will signal to wake up this process
+    pProcInfo->wakeup_time = system_clock() + ((unsigned long long)seconds * MICROSECONDS_PER_SECOND);// Calculate the absolute wakeup time in microseconds and store it in the structure. The clock driver will compare this against the current time to determine when to wake up the process.
+
+    k_semp(sleeping_processes_mutex);// Lock the sleeping_processes list while we add the new sleeping process to it. The list is ordered by wakeup_time, so the clock driver can efficiently check which processes need to be woken up on each tick.
+    TListAddNodeInOrder(&sleeping_processes, pProcInfo);// Add the new sleeping process to the list in order of wakeup time
+    k_semv(sleeping_processes_mutex);// Unlock the sleeping_processes list after adding the new process
+
+    k_semp(waitSem);
+    k_semfree(waitSem);
+
+    return 0;
+}
+
+static int sleep_compare(void* a, void* b)
+{
+    SleepingProcess* proc_a = (SleepingProcess*)a;
+    SleepingProcess* proc_b = (SleepingProcess*)b;
+
+    if (proc_a->wakeup_time < proc_b->wakeup_time) return  1;
+    if (proc_a->wakeup_time > proc_b->wakeup_time) return -1;
+    return 0;
 }
